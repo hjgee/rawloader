@@ -419,8 +419,12 @@ impl RawLoader {
     // Check for CR3 format using BMFF
     match Bmff::new(&buf.buf) {
       Ok(mut bmff) => {
-        if bmff.compatible_brand("crx ") {
-          return Ok(Box::new(cr3::Cr3Decoder::new(buffer, None, None, self)));
+        if let Ok(brands) = bmff.get_brands() {
+          for brand in brands {
+            if cr3::is_cr3_brand(&brand) {
+              return Ok(Box::new(cr3::Cr3Decoder::new(buffer, None, None, self)));
+            }
+          }
         }
       }
       Err(_) => { } // Not a BMFF file, continue with other format checks

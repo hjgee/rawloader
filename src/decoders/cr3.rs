@@ -3,14 +3,39 @@
 
 use std::f32::NAN;
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::convert::TryFrom;
 use byteorder::{BigEndian, ReadBytesExt, LittleEndian};
 use crate::decoders::*;
 use crate::decoders::tiff::*;
 
 const BOX_TYPE_CRAW: [u8; 4] = *b"CRAW";
+const BOX_TYPE_MOOV: [u8; 4] = *b"moov";
 const BOX_TYPE_TRAK: [u8; 4] = *b"trak";
+const BOX_TYPE_MDIA: [u8; 4] = *b"mdia";
+const BOX_TYPE_MINF: [u8; 4] = *b"minf";
+const BOX_TYPE_STBL: [u8; 4] = *b"stbl";
+const BOX_TYPE_UUID: [u8; 4] = *b"uuid";
 const BOX_TYPE_MDAT: [u8; 4] = *b"mdat";
 const BOX_TYPE_CTBO: [u8; 4] = *b"CTBO";
+
+const CR3_COMPATIBLE_BRANDS: [&[u8; 4]; 3] = [
+    b"crx ",  // Standard CR3
+    b"crx2",  // CR3 version 2
+    b"crxm",  // CR3 movie
+];
+
+fn is_container_box(box_type: &[u8; 4]) -> bool {
+    box_type == &BOX_TYPE_MOOV ||
+    box_type == &BOX_TYPE_TRAK ||
+    box_type == &BOX_TYPE_MDIA ||
+    box_type == &BOX_TYPE_MINF ||
+    box_type == &BOX_TYPE_STBL ||
+    box_type == &BOX_TYPE_UUID
+}
+
+pub fn is_cr3_brand(brand: &[u8; 4]) -> bool {
+    CR3_COMPATIBLE_BRANDS.contains(&brand)
+}
 
 #[derive(Debug)]
 struct Box {
@@ -61,13 +86,42 @@ impl<'a> Cr3Decoder<'a> {
         let mut size_bytes = [0u8; 4];
         let mut type_bytes = [0u8; 4];
 
-        if cursor.read_exact(&mut size_bytes).is_err() || 
-           cursor.read_exact(&mut type_bytes).is_err() {
-            return Err("Failed to read box header".to_string());
+        // Read size and type
+        if cursor.read_exact(&mut size_bytes).is_err() {
+            return Err("Failed to read box size".to_string());
+        }
+        if cursor.read_exact(&mut type_bytes).is_err() {
+            return Err("Failed to read box type".to_string());
         }
 
-        let size = u32::from_be_bytes(size_bytes);
-        let data_offset = cursor.position();
+        let mut size = u32::from_be_bytes(size_bytes);
+        let mut data_offset = cursor.position();
+
+        // Handle large boxes (size == 1)
+        if size == 1 {
+            // Skip large boxes for now as they're unlikely to contain CRAW
+            return Err("Large boxes not supported yet".to_string());
+        }
+
+        // Handle UUID boxes
+        if type_bytes == *b"uuid" {
+            let mut uuid = [0u8; 16];
+            if cursor.read_exact(&mut uuid).is_err() {
+                return Err("Failed to read UUID".to_string());
+            }
+            data_offset += 16;
+            eprintln!("Found UUID box: {:02x?}", uuid);
+        }
+
+        // Basic size validation
+        if size < 8 {
+            return Err(format!("Invalid box size {} at offset {}", size, offset));
+        }
+
+        // Check if we're still within the file
+        if offset + size as u64 > cursor.get_ref().len() as u64 {
+            return Err(format!("Box extends beyond file end: size {} at offset {}", size, offset));
+        }
 
         Ok(Box {
             box_type: type_bytes,
@@ -83,12 +137,31 @@ impl<'a> Cr3Decoder<'a> {
             return Err("Failed to read CRAW header".to_string());
         }
 
+        let width = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let height = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        let bit_depth = header[8];
+        let components = header[9];
+        let component_bit_depth = header[10];
+
+        // Validate header values
+        if width == 0 || height == 0 {
+            return Err("Invalid CRAW dimensions".to_string());
+        }
+        if bit_depth == 0 || bit_depth > 32 {
+            return Err("Invalid CRAW bit depth".to_string());
+        }
+        if components == 0 {
+            return Err("Invalid CRAW components".to_string());
+        }
+
+        eprintln!("CRAW header: {}x{}, {} bit, {} components", width, height, bit_depth, components);
+
         Ok(CrawHeader {
-            width: u32::from_be_bytes([header[0], header[1], header[2], header[3]]),
-            height: u32::from_be_bytes([header[4], header[5], header[6], header[7]]),
-            bit_depth: header[8],
-            components: header[9],
-            component_bit_depth: header[10],
+            width,
+            height,
+            bit_depth,
+            components,
+            component_bit_depth,
         })
     }
 
@@ -126,6 +199,10 @@ impl<'a> Cr3Decoder<'a> {
             return Ok(image);
         }
 
+        // Save current position for error reporting
+        let data_start = cursor.position();
+        eprintln!("Starting raw data decode at offset {}", data_start);
+
         // For now we're implementing basic raw data reading
         // In a full implementation, we'd need to:
         // 1. Handle different compression methods (JPEG, HEVC)
@@ -136,8 +213,9 @@ impl<'a> Cr3Decoder<'a> {
 
         for row in 0..height {
             let mut row_data = vec![0u8; row_size];
-            if cursor.read_exact(&mut row_data).is_err() {
-                return Err("Failed to read raw image data".to_string());
+            if let Err(e) = cursor.read_exact(&mut row_data) {
+                return Err(format!("Failed to read raw data at offset {} (row {}): {}",
+                    cursor.position(), row, e));
             }
 
             for col in 0..width {
@@ -182,20 +260,61 @@ impl<'a> Decoder for Cr3Decoder<'a> {
         let mut cursor = Cursor::new(self.buffer);
         let mut craw_header = None;
 
-        // Parse boxes until we find CRAW
-        while let Ok(box_header) = Self::read_box(&mut cursor) {
-            if box_header.box_type == BOX_TYPE_CRAW {
-                craw_header = Some(self.parse_craw_header(&mut cursor)?);
-                break;
-            }
-            
-            // Skip to next box
-            if box_header.size > 8 {
-                if let Err(e) = cursor.seek(SeekFrom::Start(box_header.offset + box_header.size as u64)) {
+        // Parse boxes recursively until we find CRAW
+        fn find_craw_box(cursor: &mut Cursor<&[u8]>, decoder: &Cr3Decoder, end_pos: Option<u64>) -> Result<Option<CrawHeader>, String> {
+            while let Ok(box_header) = Cr3Decoder::read_box(cursor) {
+                let box_end = box_header.offset + box_header.size as u64;
+                
+                // Check if we've reached the container's end
+                if let Some(end) = end_pos {
+                    if box_header.offset >= end {
+                        break;
+                    }
+                }
+                
+                // Convert box type to string for logging
+                let box_type = String::from_utf8_lossy(&box_header.box_type);
+                eprintln!("Found box: {} at offset {} (size: {}, data offset: {})",
+                    box_type, box_header.offset, box_header.size, box_header.data_offset);
+
+                if box_header.box_type == BOX_TYPE_CRAW {
+                    eprintln!("Found CRAW box at offset {}", box_header.offset);
+                    // Move to the data portion of the CRAW box
+                    if let Err(e) = cursor.seek(SeekFrom::Start(box_header.data_offset)) {
+                        return Err(format!("Failed to seek to CRAW data: {}", e));
+                    }
+                    let header = decoder.parse_craw_header(cursor)?;
+                    eprintln!("Successfully parsed CRAW header: {}x{} @ {} bit",
+                        header.width, header.height, header.bit_depth);
+                    return Ok(Some(header));
+                }
+                
+                // Only recurse into container boxes
+                if box_header.size > 8 && is_container_box(&box_header.box_type) {
+                    eprintln!("Entering container box: {} at offset {}", String::from_utf8_lossy(&box_header.box_type), box_header.offset);
+                    
+                    // Move to the data portion of the box
+                    if let Err(e) = cursor.seek(SeekFrom::Start(box_header.data_offset)) {
+                        return Err(format!("Failed to seek in file: {}", e));
+                    }
+                    
+                    // Recursively check this container box
+                    if let Some(header) = find_craw_box(cursor, decoder, Some(box_end))? {
+                        return Ok(Some(header));
+                    }
+                    
+                    eprintln!("Exiting container box: {} at offset {}", String::from_utf8_lossy(&box_header.box_type), box_header.offset);
+                }
+                
+                // Skip to next box
+                if let Err(e) = cursor.seek(SeekFrom::Start(box_end)) {
                     return Err(format!("Failed to seek in file: {}", e));
                 }
             }
+            Ok(None)
         }
+
+        craw_header = find_craw_box(&mut cursor, self, None)?;
 
         let header = craw_header.ok_or("Could not find CRAW box")?;
         let width = header.width as usize;

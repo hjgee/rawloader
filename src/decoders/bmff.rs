@@ -12,15 +12,10 @@ impl Bmff {
         })
     }
 
-    pub fn compatible_brand(&mut self, brand: &str) -> bool {
-        // Brand must be exactly 4 bytes
-        if brand.len() != 4 {
-            return false;
-        }
-
+    pub fn get_brands(&mut self) -> Result<Vec<[u8; 4]>, String> {
         // Reset to start of file
         if self.reader.seek(SeekFrom::Start(0)).is_err() {
-            return false;
+            return Err("Failed to seek to start of file".to_string());
         }
 
         // Read file type box
@@ -31,45 +26,40 @@ impl Bmff {
         if self.reader.read_exact(&mut size).is_err() ||
            self.reader.read_exact(&mut box_type).is_err() ||
            self.reader.read_exact(&mut major_brand).is_err() {
-            return false;
+            return Err("Failed to read ftyp box header".to_string());
         }
 
         // Check if it's a 'ftyp' box
         if &box_type != b"ftyp" {
-            return false;
+            return Err("Not a valid BMFF file (no ftyp box)".to_string());
         }
 
-        // Check major brand
-        if &major_brand == brand.as_bytes() {
-            return true;
-        }
+        let mut brands = vec![major_brand];
 
         // Skip minor version
         let mut minor_version = [0u8; 4];
         if self.reader.read_exact(&mut minor_version).is_err() {
-            return false;
+            return Ok(brands); // Return just major brand if we can't read more
         }
 
         // Read compatible brands
         let box_size = u32::from_be_bytes(size);
         if box_size < 16 { // Basic sanity check
-            return false;
+            return Ok(brands);
         }
         let num_brands = (box_size as usize - 16) / 4; // 16 = size(4) + type(4) + major_brand(4) + minor_version(4)
         if num_brands > 100 { // Sanity check to prevent excessive iterations
-            return false;
+            return Ok(brands);
         }
         
-        let mut brand_buf = [0u8; 4];
         for _ in 0..num_brands {
+            let mut brand_buf = [0u8; 4];
             if self.reader.read_exact(&mut brand_buf).is_err() {
-                return false;
+                break;
             }
-            if &brand_buf == brand.as_bytes() {
-                return true;
-            }
+            brands.push(brand_buf);
         }
 
-        false
+        Ok(brands)
     }
 }
