@@ -1,9 +1,12 @@
 use std::collections::HashMap;
-use std::io::{Read, BufReader};
+use std::io::{Read, BufReader, Seek, Cursor};
 use std::fs::File;
 use std::panic;
 use std::path::Path;
 use toml::Value;
+
+mod bmff;
+use self::bmff::Bmff;
 
 macro_rules! fetch_tag {
   ($tiff:expr, $tag:expr) => (
@@ -412,6 +415,16 @@ impl RawLoader {
   /// Returns a decoder for a given buffer
   pub fn get_decoder<'b>(&'b self, buf: &'b Buffer) -> Result<Box<dyn Decoder+'b>, String> {
     let buffer = &buf.buf;
+    
+    // Check for CR3 format using BMFF
+    match Bmff::new(&buf.buf) {
+      Ok(mut bmff) => {
+        if bmff.compatible_brand("crx ") {
+          return Ok(Box::new(cr3::Cr3Decoder::new(buffer, None, None, self)));
+        }
+      }
+      Err(_) => { } // Not a BMFF file, continue with other format checks
+    }
 
     if mrw::is_mrw(buffer) {
       let dec = Box::new(mrw::MrwDecoder::new(buffer, &self));
@@ -444,18 +457,18 @@ impl RawLoader {
         return Ok(Box::new(cr2::Cr2Decoder::new(buffer, tiff, self)))
       }
 
-      // Check for CR3 format
-      if tiff.has_entry(Tag::Make) && fetch_tag!(tiff, Tag::Make).get_str() == "Canon" {
-        if let Some(model) = tiff.find_entry(Tag::Model) {
-          if model.get_str().ends_with("3") { // CR3 models end with "3"
-            return Ok(Box::new(cr3::Cr3Decoder::new(buffer, tiff, self)))
-          }
-        }
-      }
-
       if tiff.has_entry(Tag::Make) {
         macro_rules! use_decoder {
             ($dec:ty, $buf:ident, $tiff:ident, $rawdec:ident) => (Ok(Box::new(<$dec>::new($buf, $tiff, $rawdec)) as Box<dyn Decoder>));
+        }
+
+        // Check for CR3 format
+        if fetch_tag!(tiff, Tag::Make).get_str() == "Canon" {
+          if let Some(model) = tiff.find_entry(Tag::Model) {
+            if model.get_str().ends_with("3") { // CR3 models end with "3"
+              return Ok(Box::new(cr3::Cr3Decoder::new(buffer, Some(tiff), None, self)));
+            }
+          }
         }
 
         return match fetch_tag!(tiff, Tag::Make).get_str().to_string().as_ref() {
@@ -481,7 +494,9 @@ impl RawLoader {
           "NIKON CORPORATION"           => use_decoder!(nef::NefDecoder, buffer, tiff, self),
           "NIKON"                       => use_decoder!(nrw::NrwDecoder, buffer, tiff, self),
           "Canon"                       => use_decoder!(cr2::Cr2Decoder, buffer, tiff, self),
+          "Canon EOS 3"                 => Ok(Box::new(cr3::Cr3Decoder::new(buffer, Some(tiff), None, self))),
           "Phase One A/S"               => use_decoder!(iiq::IiqDecoder, buffer, tiff, self),
+
           make => Err(format!("Couldn't find a decoder for make \"{}\".{}", make, SAMPLE).to_string()),
         };
       } else if tiff.has_entry(Tag::Software) {
