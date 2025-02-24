@@ -89,6 +89,7 @@ mod tfr;
 mod nef;
 mod nrw;
 mod cr2;
+mod cr3;
 mod ari;
 mod x3f;
 use self::tiff::*;
@@ -441,6 +442,15 @@ impl RawLoader {
       // The DCS560C is really a CR2 camera so we just special case it here
       if tiff.has_entry(Tag::Model) && fetch_tag!(tiff, Tag::Model).get_str() == "DCS560C" {
         return Ok(Box::new(cr2::Cr2Decoder::new(buffer, tiff, self)))
+      }
+
+      // Check for CR3 format
+      if tiff.has_entry(Tag::Make) && fetch_tag!(tiff, Tag::Make).get_str() == "Canon" {
+        if let Some(model) = tiff.find_entry(Tag::Model) {
+          if model.get_str().ends_with("3") { // CR3 models end with "3"
+            return Ok(Box::new(cr3::Cr3Decoder::new(buffer, tiff, self)))
+          }
+        }
       }
 
       if tiff.has_entry(Tag::Make) {
